@@ -128,7 +128,7 @@ pre { font-size: 0.78rem !important; background: #f3f4f6 !important; }
 # =========================================================================== #
 
 _DEFAULTS: Dict[str, Any] = {
-    "beta_0":            0.008,
+    "beta_0":            0.0005,
     "g":                 0.80,
     "C_rho_sq_log":      -3.0,
     "gamma":             0.40,
@@ -440,12 +440,14 @@ def _render_sidebar() -> None:
 
     sb.slider(
         "β₀  —  mean extinction coefficient  (m⁻¹)",
-        min_value=0.002, max_value=0.020, step=0.001,
+        min_value=0.0001, max_value=0.020, step=0.0001,
+        format="%.4f",
         key="beta_0",
         help=(
             "Specifies how much light is attenuated per metre of propagation "
             "through the particle cloud.  "
-            "0.002 corresponds to light haze; 0.020 to a severe sandstorm."
+            "0.0005 corresponds to barely visible haze; 0.002 to light haze; "
+            "0.020 to a severe sandstorm."
         ),
     )
 
