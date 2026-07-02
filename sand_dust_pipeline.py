@@ -753,11 +753,6 @@ def gaussian_blur_torch(
     if squeeze:
         x = x.squeeze(0)
     return x
-    x = F.conv2d(x, k_v, padding=0, groups=C)
-
-    if squeeze:
-        x = x.squeeze(0)
-    return x
 
 
 def _build_gaussian_pyramid_torch(
