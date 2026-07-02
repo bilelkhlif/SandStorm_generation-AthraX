@@ -341,6 +341,20 @@ def process_video(input_path: Path, output_dir: Path) -> None:
     # ── 2. Depth estimation ────────────────────────────────────────────────
     _load_midas()   # exits cleanly if torch / transformers missing
 
+    # Detect compute device for the degradation step (MiDaS already used
+    # the same device; reuse the same preference here).
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _deg_device = "cuda"
+        elif hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
+            _deg_device = "mps"
+        else:
+            _deg_device = "cpu"
+    except ImportError:
+        _deg_device = "cpu"
+    print(f"[degradation] Will use {_deg_device.upper()} for physics degradation.")
+
     depth_source_label = (
         "Intel/dpt-hybrid-midas – relative inverse depth "
         f"linearly rescaled to [{DEPTH_MIN_M}, {DEPTH_MAX_M}] m  "
@@ -375,6 +389,7 @@ def process_video(input_path: Path, output_dir: Path) -> None:
         sequence_seed     = 42,
         n_ray_steps       = 64,
         n_blur_levels     = 16,
+        use_gpu           = (_deg_device != "cpu"),
     )
 
     # Annotate metadata with depth provenance

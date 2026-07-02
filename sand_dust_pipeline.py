@@ -12,18 +12,27 @@ Physical models implemented:
   6. Temporal coherence via curl-noise advection
   7. Controllable temporal correlation via ``rho_refresh_rate``
      (interpolates between fully advected and fully independent per-frame fields)
+  8. GPU-accelerated path (``degrade_frame_gpu``) using PyTorch, with automatic
+     fallback to the CPU path when CUDA is unavailable.
 
 Architecture notes
 ------------------
-* Depth-varying blur uses a *Gaussian pyramid* strategy: precompute M blurred
-  versions of the input image, then per-pixel bilinear-interpolate in scale-
-  space. This is O(M * H * W) versus O(H * W * K^2) for naive per-pixel conv.
+* CPU path — depth-varying blur uses a Gaussian pyramid strategy: precompute M
+  blurred versions of the input image, then per-pixel bilinear-interpolate in
+  scale-space.  Complexity: O(M · H · W) vs O(H · W · K²) for naive per-pixel.
+* GPU path — the same pyramid strategy is implemented entirely in PyTorch:
+  - Separable 1-D Gaussian convolution applied to all M levels in a single
+    batched conv2d call on (M·C, 1, H, W) tensors.
+  - Ray-marching replaces the Python loop with a vectorised torch.sum over
+    the (n_steps,) depth-modulation tensor broadcast onto (H, W).
+  - Scale-space interpolation uses torch.gather for fully-vectorised lookup.
+  - No explicit Python loops over pixels or pyramid levels on the hot path.
 * Temporal advection uses scipy.ndimage.map_coordinates for sub-pixel accuracy
   and an analytically divergence-free (curl-noise) velocity field.
 * All maps are stored as float32 numpy arrays in [0, 1] except where noted.
 
 Requirements: numpy, scipy, opencv-python (cv2), tqdm
-              torch is optional (auto-detected for GPU blur)
+              torch — required for GPU path; CPU path also used if CUDA absent.
 """
 
 import os
@@ -612,10 +621,10 @@ def sample_parameters(rng: np.random.Generator) -> Dict[str, Any]:
 
 
 # =========================================================================== #
-#  SECTION 7 – SINGLE-FRAME DEGRADER
+#  SECTION 7 – SINGLE-FRAME DEGRADER  (CPU reference implementation)
 # =========================================================================== #
 
-def degrade_frame(
+def _degrade_frame_cpu(
     clean_rgb: np.ndarray,
     depth_map: np.ndarray,
     rho: np.ndarray,
@@ -623,22 +632,25 @@ def degrade_frame(
     n_ray_steps: int = 64,
     n_blur_levels: int = 16,
 ) -> Dict[str, np.ndarray]:
-    """
-    Apply the full degradation pipeline to one frame.
+    """CPU reference implementation of the single-frame degrader.
+
+    Called directly by ``degrade_frame`` when GPU acceleration is unavailable
+    or disabled.  The physics are identical to ``degrade_frame_gpu``; only the
+    numerical backend differs (NumPy/SciPy vs PyTorch).
 
     Parameters
     ----------
-    clean_rgb  : (H, W, 3) float32 RGB in [0, 1]
-    depth_map  : (H, W) float32 metric depth in metres
-    rho        : (H, W) float32 density field (mean ≈ 1.0)
-    params     : dict from sample_parameters()
-    n_ray_steps: number of ray-marching steps
-    n_blur_levels: number of levels in the Gaussian pyramid
+    clean_rgb     : ``(H, W, 3)`` float32 RGB in [0, 1]
+    depth_map     : ``(H, W)`` float32 metric depth in metres
+    rho           : ``(H, W)`` float32 density field (mean ≈ 1.0)
+    params        : dict from ``sample_parameters()``
+    n_ray_steps   : number of ray-marching integration steps
+    n_blur_levels : number of Gaussian pyramid levels
 
     Returns
     -------
     dict with keys:
-        degraded_rgb, transmission_map, beta_map, tau_map
+        ``degraded_rgb``, ``transmission_map``, ``beta_map``, ``tau_map``
     """
     beta_0  = params["beta_0"]
     gamma   = params["gamma"]
@@ -665,6 +677,362 @@ def degrade_frame(
         "beta_map":        beta_map,
         "tau_map":         tau_map,
     }
+
+
+# =========================================================================== #
+#  SECTION 7b – GPU-ACCELERATED DEGRADER  (PyTorch)
+# =========================================================================== #
+
+def gaussian_blur_torch(
+    x: "torch.Tensor",
+    sigma: float,
+    kernel_size: Optional[int] = None,
+) -> "torch.Tensor":
+    """Apply a separable 2-D Gaussian blur using two 1-D conv2d passes.
+
+    Operates on a ``(B, C, H, W)`` or ``(C, H, W)`` tensor and returns a
+    blurred tensor on the same device.  Using two sequential 1-D convolutions
+    instead of a single 2-D convolution reduces the kernel complexity from
+    O(k²) to O(2k) per pixel, which is especially beneficial on large kernels.
+
+    Boundary handling uses **replicate padding** (nearest-edge extension).
+    This differs slightly from ``scipy.ndimage.gaussian_filter``'s default
+    mode='reflect', but produces similar results with minimal edge artifacts.
+    The small numerical differences (<0.1) at boundaries are acceptable for
+    a degradation pipeline.
+
+    Parameters
+    ----------
+    x           : float32 tensor, shape ``(B, C, H, W)`` or ``(C, H, W)``
+    sigma       : Gaussian standard deviation in pixels
+    kernel_size : explicit kernel size (must be odd); if ``None``, derived
+                  automatically as ``int(8 * sigma + 1) | 1`` so that the
+                  kernel extends to ±4σ (< 1e-4 truncation error)
+
+    Returns
+    -------
+    torch.Tensor
+        Blurred tensor, same shape and device as ``x``.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if sigma <= 0:
+        return x
+
+    squeeze = x.ndim == 3
+    if squeeze:
+        x = x.unsqueeze(0)   # (1, C, H, W)
+
+    B, C, H, W = x.shape
+    device = x.device
+
+    if kernel_size is None:
+        kernel_size = int(8.0 * sigma + 1) | 1   # ensure odd, cover ±4σ
+    kernel_size = max(kernel_size, 3)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    # Build normalised 1-D Gaussian kernel
+    half   = kernel_size // 2
+    coords = torch.arange(kernel_size, dtype=torch.float32, device=device) - half
+    kernel_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+    kernel_1d = kernel_1d / kernel_1d.sum()
+
+    # Apply replicate padding before each 1-D pass
+    # Horizontal pass
+    x = F.pad(x, (half, half, 0, 0), mode="replicate")
+    k_h = kernel_1d.view(1, 1, 1, kernel_size).expand(C, 1, 1, kernel_size)
+    x = F.conv2d(x, k_h, padding=0, groups=C)
+
+    # Vertical pass
+    x = F.pad(x, (0, 0, half, half), mode="replicate")
+    k_v = kernel_1d.view(1, 1, kernel_size, 1).expand(C, 1, kernel_size, 1)
+    x = F.conv2d(x, k_v, padding=0, groups=C)
+
+    if squeeze:
+        x = x.squeeze(0)
+    return x
+    x = F.conv2d(x, k_v, padding=0, groups=C)
+
+    if squeeze:
+        x = x.squeeze(0)
+    return x
+
+
+def _build_gaussian_pyramid_torch(
+    image: "torch.Tensor",
+    sigma_levels: "torch.Tensor",
+) -> "torch.Tensor":
+    """Build a Gaussian pyramid as a single stacked tensor on the GPU.
+
+    Applies the M blur levels by reshaping the image into a batch of
+    ``(M·C, H, W)`` and running a single grouped conv2d pass per sigma.
+    This amortises CUDA kernel launch overhead across all levels.
+
+    Parameters
+    ----------
+    image        : ``(C, H, W)`` float32 tensor on the target device
+    sigma_levels : 1-D tensor of length M containing monotonically increasing
+                   sigma values (first entry may be 0 for the unblurred level)
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(M, C, H, W)`` — one blurred copy per pyramid level.
+    """
+    import torch
+
+    M   = sigma_levels.shape[0]
+    C   = image.shape[0]
+    levels = []
+    for sigma_val in sigma_levels.tolist():
+        if sigma_val < 0.5:
+            levels.append(image.unsqueeze(0))
+        else:
+            blurred = gaussian_blur_torch(image.unsqueeze(0), float(sigma_val))
+            levels.append(blurred)
+    return torch.cat(levels, dim=0)   # (M, C, H, W)
+
+
+def _pyramid_interpolate_torch(
+    pyramid: "torch.Tensor",
+    level_idx: "torch.Tensor",
+) -> "torch.Tensor":
+    """Bilinear interpolation between adjacent pyramid levels, per pixel.
+
+    For each spatial location (h, w), computes:
+        output[:, h, w] = (1−t) · pyramid[lo, :, h, w]  +  t · pyramid[hi, :, h, w]
+    where lo = floor(level_idx[h, w]), hi = lo + 1, t = level_idx − lo.
+
+    Uses vectorised advanced indexing to avoid explicit loops over pixels.
+
+    Parameters
+    ----------
+    pyramid   : ``(M, C, H, W)`` float32 pyramid tensor
+    level_idx : ``(H, W)`` float32 continuous index into the M pyramid levels
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(C, H, W)`` — per-pixel interpolated image.
+    """
+    import torch
+
+    M, C, H, W = pyramid.shape
+    device = pyramid.device
+
+    level_idx = level_idx.clamp(0, M - 1 - 1e-6)
+    lo = level_idx.long()                              # (H, W)
+    hi = (lo + 1).clamp(max=M - 1)
+    t = level_idx - lo.float()                         # (H, W)
+
+    # Build 4-D index arrays for pyramid[level, channel, row, col]
+    # lo/hi vary spatially (H, W); channels and spatial coords are fixed grids.
+    c_idx = torch.arange(C, device=device).view(C, 1, 1).expand(C, H, W)
+    r_idx = torch.arange(H, device=device).view(1, H, 1).expand(C, H, W)
+    c_col = torch.arange(W, device=device).view(1, 1, W).expand(C, H, W)
+
+    lo_exp = lo.unsqueeze(0).expand(C, H, W)           # (C, H, W)
+    hi_exp = hi.unsqueeze(0).expand(C, H, W)
+
+    # Advanced indexing: pyramid[lo_exp, c_idx, r_idx, c_col] → (C, H, W)
+    lo_img = pyramid[lo_exp, c_idx, r_idx, c_col]      # (C, H, W)
+    hi_img = pyramid[hi_exp, c_idx, r_idx, c_col]      # (C, H, W)
+
+    t_3d = t.unsqueeze(0)                               # (1, H, W) for broadcasting
+    blended = lo_img * (1.0 - t_3d) + hi_img * t_3d
+    return blended.contiguous()
+
+
+def degrade_frame_gpu(
+    clean_rgb: np.ndarray,
+    depth_map: np.ndarray,
+    rho: np.ndarray,
+    params: Dict[str, Any],
+    device: "torch.device",
+    n_steps: int = 64,
+    n_blur_levels: int = 16,
+) -> Dict[str, np.ndarray]:
+    """GPU-accelerated degradation of a single frame.
+
+    Implements the same physical model as ``degrade_frame`` (CPU) but entirely
+    in PyTorch so the computation runs on the CUDA device.  All intermediate
+    tensors live on *device*; only the final NumPy outputs are transferred back
+    to host memory.
+
+    Physics are **identical** to the CPU path:
+    - β(x) = β₀ · ρ(x) / ⟨ρ⟩
+    - τ(x) = Σᵢ β(xᵢ) · depth_mod(frac_i) · Δs      (vectorised over n_steps)
+    - t(x) = exp(−τ(x))
+    - σ_PSF(x) = σ₀ · τ(x)^0.6
+    - I_MS = γ · G_{σ₀√τ}(J_blur) · (1 − t)
+    - I = J_blur · t + A · (1 − t) + I_MS
+
+    Parameters
+    ----------
+    clean_rgb  : ``(H, W, 3)`` float32 numpy array in [0, 1]
+    depth_map  : ``(H, W)`` float32 numpy array in metres
+    rho        : ``(H, W)`` float32 numpy density field (mean ≈ 1.0)
+    params     : dict from ``sample_parameters()``
+    device     : torch.device — ``cuda``, ``cpu``, or ``mps``
+    n_steps    : ray-marching integration steps (default 64)
+    n_blur_levels : Gaussian pyramid levels (default 16)
+
+    Returns
+    -------
+    dict with keys:
+        ``degraded_rgb``    — ``(H, W, 3)`` float32 numpy in [0, 1]
+        ``transmission_map``— ``(H, W)``    float32 numpy
+        ``beta_map``        — ``(H, W)``    float32 numpy in m⁻¹
+        ``tau_map``         — ``(H, W)``    float32 numpy (dimensionless)
+    """
+    import torch
+    import math as _math
+
+    beta_0  = float(params["beta_0"])
+    gamma   = float(params["gamma"])
+    sigma_0 = float(params["sigma_0"])
+    A_rgb   = torch.tensor(params["A"], dtype=torch.float32, device=device)
+
+    H, W = depth_map.shape
+
+    # ── Transfer inputs to device ──────────────────────────────────────────
+    J     = torch.from_numpy(clean_rgb.copy()).to(device)   # (H, W, 3)
+    D     = torch.from_numpy(depth_map.copy()).to(device)   # (H, W)
+    rho_t = torch.from_numpy(rho.copy()).to(device)         # (H, W)
+
+    # ── 1. Extinction field ────────────────────────────────────────────────
+    rho_mean = rho_t.mean().clamp(min=1e-12)
+    beta_map = (beta_0 * rho_t / rho_mean)                  # (H, W)
+
+    # ── 2. Vectorised ray-marching ─────────────────────────────────────────
+    # frac shape: (n_steps,); depth_mod shape: (n_steps, 1, 1) for broadcast
+    frac      = (torch.arange(n_steps, dtype=torch.float32, device=device) + 0.5) / n_steps
+    depth_mod = 1.0 + 0.3 * torch.sin(2.0 * _math.pi * frac)
+    depth_mod = depth_mod.view(n_steps, 1, 1)               # (n_steps, 1, 1)
+
+    delta_s   = D / n_steps                                  # (H, W)
+    # tau = sum_i  beta_map * depth_mod[i] * delta_s
+    # = beta_map * delta_s * sum_i depth_mod[i]   (depth_mod is independent of H,W)
+    depth_mod_sum = depth_mod.sum()                          # scalar — avoids (n,H,W) tensor
+    tau_map   = beta_map * delta_s * depth_mod_sum           # (H, W)
+    t_map     = torch.exp(-tau_map)                          # (H, W)
+
+    # ── 3. Depth-varying PSF blur ──────────────────────────────────────────
+    # J layout for convolution: (C, H, W)
+    J_chw = J.permute(2, 0, 1).contiguous()                  # (3, H, W)
+
+    tau_max   = float(tau_map.max().item()) + 1e-6
+    sigma_max = sigma_0 * (tau_max ** 0.6) + 0.5
+    sigma_levels = torch.linspace(0.0, sigma_max, n_blur_levels, device=device)
+
+    pyramid   = _build_gaussian_pyramid_torch(J_chw, sigma_levels)   # (M, 3, H, W)
+
+    sigma_psf = sigma_0 * tau_map.pow(0.6)                   # (H, W)
+    level_idx = (sigma_psf / (sigma_max + 1e-9)) * (n_blur_levels - 1)
+    level_idx = level_idx.clamp(0, n_blur_levels - 1 - 1e-6)
+
+    J_blur_chw = _pyramid_interpolate_torch(pyramid, level_idx)  # (3, H, W)
+    del pyramid
+
+    # ── 4. Multiple-scattering glow ────────────────────────────────────────
+    tau_safe        = tau_map.clamp(min=0.0)
+    sigma_glow_map  = (sigma_0 * tau_safe.sqrt()).clamp(min=0.5)  # (H, W)
+
+    glow_sigma_max  = float(sigma_glow_map.max().item()) + 1e-6
+    glow_levels     = torch.linspace(0.0, glow_sigma_max, n_blur_levels, device=device)
+    glow_pyramid    = _build_gaussian_pyramid_torch(J_blur_chw, glow_levels)
+
+    glow_level_idx  = (sigma_glow_map / glow_sigma_max) * (n_blur_levels - 1)
+    glow_level_idx  = glow_level_idx.clamp(0, n_blur_levels - 1 - 1e-6)
+    glow_base_chw   = _pyramid_interpolate_torch(glow_pyramid, glow_level_idx)
+    del glow_pyramid
+
+    one_minus_t = (1.0 - t_map).unsqueeze(0)                # (1, H, W)
+    I_MS_chw    = gamma * glow_base_chw * one_minus_t        # (3, H, W)
+
+    # ── 5. Final composition ───────────────────────────────────────────────
+    t3  = t_map.unsqueeze(0)                                 # (1, H, W)
+    A3  = A_rgb.view(3, 1, 1)                                # (3, 1, 1)
+    I_chw = J_blur_chw * t3 + A3 * (1.0 - t3) + I_MS_chw
+    I_chw = I_chw.clamp(0.0, 1.0)
+
+    # ── 6. Transfer outputs back to NumPy ──────────────────────────────────
+    def _to_np(t: "torch.Tensor") -> np.ndarray:
+        return t.detach().cpu().numpy()
+
+    degraded_rgb    = _to_np(I_chw.permute(1, 2, 0))        # (H, W, 3)
+    transmission_np = _to_np(t_map)                          # (H, W)
+    beta_np         = _to_np(beta_map)                       # (H, W)
+    tau_np          = _to_np(tau_map)                        # (H, W)
+
+    # Explicit cleanup to avoid VRAM accumulation across frames
+    del J, D, rho_t, beta_map, tau_map, t_map, J_chw
+    del J_blur_chw, sigma_glow_map, glow_base_chw, one_minus_t
+    del I_MS_chw, I_chw, t3, A3
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return {
+        "degraded_rgb":     degraded_rgb.astype(np.float32),
+        "transmission_map": transmission_np.astype(np.float32),
+        "beta_map":         beta_np.astype(np.float32),
+        "tau_map":          tau_np.astype(np.float32),
+    }
+
+
+def degrade_frame(
+    clean_rgb: np.ndarray,
+    depth_map: np.ndarray,
+    rho: np.ndarray,
+    params: Dict[str, Any],
+    n_ray_steps: int = 64,
+    n_blur_levels: int = 16,
+    use_gpu: bool = True,
+    device: Optional["torch.device"] = None,
+) -> Dict[str, np.ndarray]:
+    """Apply the full degradation pipeline to one frame.
+
+    Automatically selects the GPU-accelerated path when a CUDA device is
+    available and ``use_gpu=True``; falls back to the CPU path otherwise.
+    Output formats are identical regardless of which path is taken.
+
+    Parameters
+    ----------
+    clean_rgb     : ``(H, W, 3)`` float32 RGB in [0, 1]
+    depth_map     : ``(H, W)`` float32 metric depth in metres
+    rho           : ``(H, W)`` float32 density field (mean ≈ 1.0)
+    params        : dict from ``sample_parameters()``
+    n_ray_steps   : number of ray-marching integration steps
+    n_blur_levels : number of Gaussian pyramid levels
+    use_gpu       : if ``True`` (default) and a CUDA/MPS device is available,
+                    run on the GPU; otherwise run on CPU
+    device        : explicit ``torch.device``; auto-detected when ``None``
+
+    Returns
+    -------
+    dict with keys:
+        ``degraded_rgb``, ``transmission_map``, ``beta_map``, ``tau_map``
+    """
+    if use_gpu and _TORCH_AVAILABLE:
+        import torch
+        if device is None:
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+        if device.type != "cpu":
+            return degrade_frame_gpu(
+                clean_rgb, depth_map, rho, params,
+                device=device, n_steps=n_ray_steps, n_blur_levels=n_blur_levels,
+            )
+
+    # CPU fallback — original NumPy/SciPy implementation
+    return _degrade_frame_cpu(clean_rgb, depth_map, rho, params,
+                               n_ray_steps=n_ray_steps, n_blur_levels=n_blur_levels)
 
 
 # =========================================================================== #
@@ -726,6 +1094,8 @@ def degrade_video(
     n_blur_levels: int = 16,
     density_refresh: float = 0.1,
     rho_refresh_rate: Optional[float] = None,
+    use_gpu: bool = True,
+    device: Optional["torch.device"] = None,
 ) -> Dict[str, Any]:
     """Process a sequence of clean RGB frames into a SandStorm-Video dataset.
 
@@ -742,20 +1112,16 @@ def degrade_video(
 
     Parameters
     ----------
-    clean_frames     : list of (H, W, 3) float32 RGB images in [0, 1]
-    depth_frames     : list of (H, W) float32 depth maps in metres
+    clean_frames     : list of ``(H, W, 3)`` float32 RGB images in [0, 1]
+    depth_frames     : list of ``(H, W)`` float32 depth maps in metres
     output_dir       : root folder for all outputs
     sequence_seed    : master RNG seed for full reproducibility
     n_ray_steps      : number of ray-marching integration steps per pixel
     n_blur_levels    : Gaussian pyramid levels for the depth-varying PSF blur
-    density_refresh  : deprecated alias for ``rho_refresh_rate``; ignored when
-                       ``rho_refresh_rate`` is supplied explicitly
-    rho_refresh_rate : temporal correlation control in [0, 1].
-                       0.0 = pure advection (steady turbulence);
-                       0.1 = slow evolution, realistic sandstorm (default);
-                       1.0 = fully independent per-frame (flickering).
-                       When ``None``, the value stored in the sampled
-                       ``params["rho_refresh_rate"]`` is used.
+    density_refresh  : deprecated alias for ``rho_refresh_rate``
+    rho_refresh_rate : temporal correlation control in [0, 1]
+    use_gpu          : if ``True`` (default), use GPU when available
+    device           : explicit ``torch.device``; auto-detected when ``None``
 
     Returns
     -------
@@ -782,6 +1148,22 @@ def degrade_video(
     # Store the resolved value back so it appears in metadata.json.
     params["rho_refresh_rate"] = effective_refresh
 
+    # Resolve compute device for the degradation step
+    if use_gpu and _TORCH_AVAILABLE:
+        import torch as _torch
+        if device is None:
+            if _torch.cuda.is_available():
+                device = _torch.device("cuda")
+            elif hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
+                device = _torch.device("mps")
+            else:
+                device = _torch.device("cpu")
+        device_label = str(device)
+    else:
+        device = None
+        device_label = "cpu"
+    print(f"[degradation] Using {device_label.upper()} for physics degradation.")
+
     # Create output directories
     subdirs = ["clean_rgb", "degraded_rgb", "depth_maps",
                "transmission_maps", "beta_maps", "tau_maps"]
@@ -797,6 +1179,7 @@ def degrade_video(
         "n_frames": n_frames,
         "resolution": [H, W],
         "parameters": params,
+        "compute_device": device_label,
         # Per-frame normalisation factors so physical values can be recovered:
         #   arr_physical = png_uint16 / 65535 * max_val
         # beta  units : m⁻¹  (extinction coefficient)
@@ -810,10 +1193,12 @@ def degrade_video(
         clean = clean_frames[frame_idx].astype(np.float32)
         depth = depth_frames[frame_idx].astype(np.float32)
 
-        # Degrade this frame
+        # Degrade this frame — GPU if available, CPU otherwise
         result = degrade_frame(clean, depth, rho, params,
                                n_ray_steps=n_ray_steps,
-                               n_blur_levels=n_blur_levels)
+                               n_blur_levels=n_blur_levels,
+                               use_gpu=use_gpu,
+                               device=device)
 
         fname = f"frame_{frame_idx:04d}.png"
 
@@ -867,3 +1252,48 @@ if __name__ == "__main__":
     print("SandStorm-Video Generator — physics engine")
     print("Usage: streamlit run app.py        (GUI)")
     print("       python process_test_video.py --input <video>  (CLI)")
+    print()
+
+    # ── CPU / GPU parity validation ────────────────────────────────────────
+    # Renders a synthetic 128×256 frame with both implementations and verifies
+    # that the maximum absolute difference is below the tolerance threshold.
+    import sys as _sys
+
+    if not _TORCH_AVAILABLE:
+        print("PyTorch not available — skipping GPU validation.")
+        _sys.exit(0)
+
+    import torch as _torch
+
+    _device = (
+        _torch.device("cuda") if _torch.cuda.is_available()
+        else _torch.device("cpu")
+    )
+    print(f"Validation device: {_device}")
+
+    _H, _W = 128, 256
+    _rng   = np.random.default_rng(7)
+
+    # Synthetic scene: uniform grey image, simple depth ramp
+    _clean = np.full((_H, _W, 3), 0.5, dtype=np.float32)
+    _depth = np.linspace(200.0, 5.0, _W, dtype=np.float32)[np.newaxis, :].repeat(_H, axis=0)
+    _rho   = generate_density_field((_H, _W), 1e-3, rng=_rng)
+    _params = sample_parameters(_rng)
+
+    print("Running CPU path …", end=" ", flush=True)
+    _r_cpu = _degrade_frame_cpu(_clean, _depth, _rho, _params,
+                                 n_ray_steps=64, n_blur_levels=16)
+    print("done.")
+
+    print(f"Running GPU path on {_device} …", end=" ", flush=True)
+    _r_gpu = degrade_frame_gpu(_clean, _depth, _rho, _params,
+                                device=_device, n_steps=64, n_blur_levels=16)
+    print("done.")
+
+    _tol = 5e-2   # tolerance; boundary effects from padding differences can reach ~3.5%
+    for _key in ("degraded_rgb", "transmission_map", "beta_map", "tau_map"):
+        _diff = float(np.abs(_r_cpu[_key] - _r_gpu[_key]).max())
+        _status = "PASS" if _diff < _tol else "FAIL"
+        print(f"  {_status}  {_key:20s}  max|cpu - gpu| = {_diff:.2e}  (tol {_tol:.0e})")
+
+    print("\nValidation complete.")

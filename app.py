@@ -359,7 +359,18 @@ def run_pipeline(
     overall.progress(30, text="Stage 3 / 4  —  Degradation")
 
     # Stage 3 — physics degradation
-    status.text("Applying sand/dust degradation model...")
+    try:
+        import torch as _torch
+        _gpu_available = _torch.cuda.is_available() or (
+            hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available()
+        )
+    except ImportError:
+        _gpu_available = False
+
+    _device_label = "GPU" if _gpu_available else "CPU"
+    status.text(f"Applying sand/dust degradation model ({_device_label})...")
+    _log(f"[degradation] Using {_device_label} for physics degradation.")
+
     metadata = degrade_video(
         clean_frames     = clean_frames,
         depth_frames     = depth_frames,
@@ -368,6 +379,7 @@ def run_pipeline(
         n_ray_steps      = n_ray_steps,
         n_blur_levels    = 16,
         rho_refresh_rate = params.get("rho_refresh_rate", 0.1),
+        use_gpu          = _gpu_available,
     )
     _log(f"[degrade] {n_frames} frames degraded. Output: {output_dir}")
     overall.progress(85, text="Stage 4 / 4  —  Video Encoding")
