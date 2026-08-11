@@ -27,6 +27,9 @@ env/
 # Pipeline outputs
 output_*/
 
+# Downloaded datasets (e.g. VisDrone via download_visdrone.py)
+data/
+
 # MiDaS model weights (large; downloaded automatically on first run)
 midas_model/
 

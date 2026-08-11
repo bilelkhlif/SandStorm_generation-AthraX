@@ -13,10 +13,11 @@ extinction coefficient) — from any input video and a monocular depth estimate.
 2. [Physical Model](#physical-model)
 3. [Installation](#installation)
 4. [Usage](#usage)
-5. [Parameter Reference](#parameter-reference)
-6. [Output Structure](#output-structure)
-7. [Citation](#citation)
-8. [License](#license)
+5. [Batch Dataset Processing (VisDrone)](#batch-dataset-processing-visdrone)
+6. [Parameter Reference](#parameter-reference)
+7. [Output Structure](#output-structure)
+8. [Citation](#citation)
+9. [License](#license)
 
 ---
 
@@ -133,6 +134,77 @@ python process_test_video.py --input path/to/video.mp4 --output_dir output/
 ```
 
 All parameters are sampled from Table 4 ranges with `--seed 42` by default.
+
+---
+
+## Batch Dataset Processing (VisDrone)
+
+Applies the pipeline across an entire [VisDrone2019](https://github.com/VisDrone/VisDrone-Dataset)
+DET/VID download instead of one video at a time — built for a cloud GPU box
+(e.g. a Lightning AI Studio) where you clone the repo and want one command
+to download the dataset and degrade all of it, unattended.
+
+```bash
+git clone https://github.com/bilelkhlif/SandStorm_generation-AthraX.git
+cd SandStorm_generation-AthraX
+bash run_visdrone.sh
+```
+
+That installs dependencies, downloads + extracts the 7 official VisDrone2019
+splits (DET train/val/test-dev/test-challenge, VID val/test-dev/test-challenge
+— ~8.2 GB compressed), and degrades every sequence/image found. Each
+VisDrone-VID sequence is processed as one temporally-coherent clip (the dust
+field advects frame-to-frame, same as a normal input video); each
+VisDrone-DET image is processed as an independent single frame. Every unit
+gets its own reproducible-but-distinct degradation parameters (`seed + unit
+index`), so severity/colour/turbulence vary across the dataset rather than
+repeating one condition everywhere.
+
+The run is resumable and fault-isolated: already-downloaded archives,
+already-extracted splits, and already-processed units are skipped on
+re-run, and a failure on one unit is logged to `output_visdrone/failures.log`
+without stopping the rest.
+
+**Check scope before committing to a full run** — the four float32 `.npy`
+ground-truth maps per frame are large (uncompressed), and a full DET+VID
+run can reach hundreds of GB:
+
+```bash
+python process_visdrone.py --dry_run
+```
+
+This reports discovered unit/frame counts and a disk-size floor (raw `.npy`
+maps only — PNGs and the source dataset add more) without processing
+anything. Narrow scope with the flags/env vars below if it exceeds your
+Studio's disk or time budget.
+
+| Env var (`run_visdrone.sh`) | Script flag | Default | Purpose |
+|---|---|---|---|
+| `VISDRONE_SPLITS` | `--splits` | `all` | Which split(s) to fetch/process, e.g. `"VisDrone2019-VID-val"` |
+| `MAX_UNITS` | `--max_units_per_split` | `0` (unlimited) | Cap sequences/images processed per split |
+| `MAX_FRAMES` | `--max_frames_per_unit` | `0` (unlimited) | Cap frames processed per sequence |
+| `DATA_ROOT` | `--data_root` | `data/VisDrone` | Download/extraction location |
+| `OUTPUT_DIR` | `--output_dir` | `output_visdrone` | Degraded output location |
+
+Recommended first call — a full download→depth→degrade→encode smoke test on
+one short sequence, done in a couple of minutes:
+
+```bash
+VISDRONE_SPLITS="VisDrone2019-VID-val" MAX_UNITS=1 MAX_FRAMES=20 bash run_visdrone.sh
+```
+
+Output mirrors the dataset layout: `output_visdrone/<split>/<sequence-or-image-name>/`,
+each containing the same `clean_rgb/ degraded_rgb/ depth_maps/ transmission_maps/
+beta_maps/ tau_maps/ metadata.json` structure described below, plus a
+`<name>_sandstorm.mp4` preview for multi-frame units. A top-level
+`output_visdrone/run_summary.json` records processed/skipped/failed counts
+per split once the run finishes.
+
+`download_visdrone.py` and `process_visdrone.py` also run standalone if you
+want finer control than the env vars above (`--help` on either for the full
+flag list). Note VisDrone-VID-train (7.5 GB) is intentionally not included —
+it isn't in the shared folder this integration targets; add its file ID to
+`_SPLITS` in `download_visdrone.py` if you need it.
 
 ---
 
