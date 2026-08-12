@@ -4,11 +4,16 @@ download_visdrone.py
 Downloads and extracts the VisDrone2019 DET + VID splits used by
 process_visdrone.py.
 
-File IDs below are the official links published at
-https://github.com/VisDrone/VisDrone-Dataset (verified against the shared
-folder https://drive.google.com/drive/folders/1TX4TAFiOOkOcId2s8dJYD-hB2mPD9kvS
-— same 7 files, matching sizes). VID-train is intentionally not included:
-it is not present in that shared folder.
+File IDs below point into
+https://drive.google.com/drive/folders/1TX4TAFiOOkOcId2s8dJYD-hB2mPD9kvS —
+the same 7 files (by name and size) as the official links published at
+https://github.com/VisDrone/VisDrone-Dataset, but distinct Drive copies
+with their own file IDs, not the same file objects. That matters in
+practice: the official IDs are so heavily downloaded that Google routinely
+rate-limits them ("too many users have viewed or downloaded this file"),
+while this folder's copies are not — confirmed by testing an actual
+download against both. VID-train is intentionally not included: it is not
+present in that shared folder.
 
 Idempotent: re-running skips any split whose zip already exists (validated
 as a real zip, not just present) and whose extraction folder already has
@@ -44,14 +49,17 @@ except ImportError:
     sys.exit("[ERROR] gdown is not installed. Run: pip install -r requirements.txt")
 
 # split name -> (google_drive_file_id, zip_filename)
+# IDs are this project's own Drive folder copies (see module docstring) --
+# verified working (DET-val downloaded clean) when the official IDs were
+# rate-limited.
 _SPLITS = {
-    "VisDrone2019-DET-train":          ("1a2oHjcEcwXP8oUF95qiwrqzACb2YlUhn", "VisDrone2019-DET-train.zip"),
-    "VisDrone2019-DET-val":            ("1bxK5zgLn0_L8x276eKkuYA_FzwCIjb59", "VisDrone2019-DET-val.zip"),
-    "VisDrone2019-DET-test-dev":       ("1PFdW_VFSCfZ_sTSZAGjQdifF_Xd5mf0V", "VisDrone2019-DET-test-dev.zip"),
-    "VisDrone2019-DET-test-challenge": ("1KN8R3oioOvSXH492GEVk-Hx74nWHAcXT", "VisDrone2019-DET-test-challenge.zip"),
-    "VisDrone2019-VID-val":            ("1xuG7Z3IhVfGGKMe3Yj6RnrFHqo_d2a1B", "VisDrone2019-VID-val.zip"),
-    "VisDrone2019-VID-test-dev":       ("1-BEq--FcjshTF1UwUabby_LHhYj41os5", "VisDrone2019-VID-test-dev.zip"),
-    "VisDrone2019-VID-test-challenge": ("1Qwyp_cEpGyXGqJ8IbusEzuNHgbM403NP", "VisDrone2019-VID-test-challenge.zip"),
+    "VisDrone2019-DET-train":          ("1RqAJfK5k-hvMYDaWJBUSHBDTA75ON60R", "VisDrone2019-DET-train.zip"),
+    "VisDrone2019-DET-val":            ("1G35pedLyEwWWOpfY91QJ_fVilMvitOe1", "VisDrone2019-DET-val.zip"),
+    "VisDrone2019-DET-test-dev":       ("1_V-g3y5KjqRi1vO4MRGq9R4l6qhkTRYO", "VisDrone2019-DET-test-dev.zip"),
+    "VisDrone2019-DET-test-challenge": ("1yRo7eEP4ZSC5uyRNS5nyGTy_4hTBtmxP", "VisDrone2019-DET-test-challenge.zip"),
+    "VisDrone2019-VID-val":            ("1LX22RAKBVFotS0fQFPomRZ38lXd0stGM", "VisDrone2019-VID-val.zip"),
+    "VisDrone2019-VID-test-dev":       ("1fn1hTFd3ygyrKTvV0AkYi9Dk9tIbxJkb", "VisDrone2019-VID-test-dev.zip"),
+    "VisDrone2019-VID-test-challenge": ("1-KIo5O4_zhz3TcWeiAlwM6-cr2Sa0cdX", "VisDrone2019-VID-test-challenge.zip"),
 }
 
 
