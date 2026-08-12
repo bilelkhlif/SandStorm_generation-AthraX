@@ -1092,6 +1092,8 @@ def degrade_video(
     rho_refresh_rate: Optional[float] = None,
     use_gpu: bool = True,
     device: Optional["torch.device"] = None,
+    save_clean_rgb: bool = True,
+    save_depth_maps: bool = True,
 ) -> Dict[str, Any]:
     """Process a sequence of clean RGB frames into a SandStorm-Video dataset.
 
@@ -1121,6 +1123,14 @@ def degrade_video(
     rho_refresh_rate : temporal correlation control in [0, 1]
     use_gpu          : if ``True`` (default), use GPU when available
     device           : explicit ``torch.device``; auto-detected when ``None``
+    save_clean_rgb   : if ``False``, skip writing clean_rgb/ (the input frames
+                       are unaffected by ``params`` and identical across calls
+                       that share ``clean_frames`` — e.g. multiple degradation
+                       variants of the same source video; save once, skip the
+                       rest). Metadata is written either way.
+    save_depth_maps  : same idea as ``save_clean_rgb``, for depth_maps/ (the
+                       depth estimate is independent of ``params`` too).
+                       ``frame_map_maxvals["depth_m"]`` is ``None`` when skipped.
 
     Returns
     -------
@@ -1211,11 +1221,15 @@ def degrade_video(
 
         # Save outputs; _save_float_map returns the per-frame max_val used for
         # PNG normalisation so that raw physical values can be reconstructed.
-        _save_rgb(str(Path(output_dir, "clean_rgb",    fname)), clean)
+        # clean_rgb/depth_maps don't depend on `params`, so callers processing
+        # multiple degradation variants of the same clean_frames/depth_frames
+        # can save them once (save_clean_rgb/save_depth_maps=False elsewhere).
+        if save_clean_rgb:
+            _save_rgb(str(Path(output_dir, "clean_rgb", fname)), clean)
         _save_rgb(str(Path(output_dir, "degraded_rgb", fname)), result["degraded_rgb"])
 
         mv_depth = _save_float_map(
-            str(Path(output_dir, "depth_maps",        fname)), depth)
+            str(Path(output_dir, "depth_maps", fname)), depth) if save_depth_maps else None
         mv_trans = _save_float_map(
             str(Path(output_dir, "transmission_maps", fname)), result["transmission_map"])
         mv_beta  = _save_float_map(

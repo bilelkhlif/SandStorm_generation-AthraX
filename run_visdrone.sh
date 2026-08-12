@@ -18,6 +18,7 @@
 #   VARIANT_MODE       "jitter" or "random"                       (default: jitter)
 #   N_VARIANTS         variants per unit in jitter mode            (default: 3)
 #   JITTER_FRAC        jitter window, fraction of each param's Table 4 range (default: 0.35)
+#   MIDAS_BATCH_SIZE   frames per MiDaS GPU call, higher = more VRAM, fewer/bigger calls (default: 8)
 #   MAX_UNITS          cap units (sequences/images) per split, 0=unlimited (default: 0)
 #   MAX_FRAMES         cap frames per sequence, 0=unlimited        (default: 0)
 #   DATA_ROOT          where to download/extract VisDrone          (default: data/VisDrone)
@@ -39,6 +40,15 @@
 # severity) with its own turbulence/wind field — real visual diversity for
 # training, not the same cloud repeated. Pass VARIANT_MODE=random for the old
 # single-random-draw-per-unit behaviour instead.
+#
+# Speed: the GPU physics itself is fast (~1-2s/variant); most wall-clock time
+# is MiDaS depth estimation + disk I/O, neither GPU-bound. Two things here
+# target that directly: depth is estimated in GPU batches (MIDAS_BATCH_SIZE
+# frames per call, not one at a time), and clean_rgb/depth_maps -- identical
+# across a unit's variants -- are only written once instead of N times. If
+# it's still too slow, N_VARIANTS=1 is the biggest remaining lever (cuts
+# both GPU and I/O work proportionally); narrowing VISDRONE_SPLITS or
+# MAX_UNITS/MAX_FRAMES is the most direct one of all.
 #
 # Two tiers of output: OUTPUT_DIR keeps the full per-frame ground truth
 # (clean/degraded PNGs + depth/transmission/beta/tau float32 maps) — large,
@@ -71,6 +81,8 @@ VISDRONE_SPLITS="${VISDRONE_SPLITS:-all}"
 VARIANT_MODE="${VARIANT_MODE:-jitter}"
 N_VARIANTS="${N_VARIANTS:-3}"
 JITTER_FRAC="${JITTER_FRAC:-0.35}"
+MIDAS_BATCH_SIZE="${MIDAS_BATCH_SIZE:-8}"
+UPLOAD_WORKERS="${UPLOAD_WORKERS:-3}"
 MAX_UNITS="${MAX_UNITS:-0}"
 MAX_FRAMES="${MAX_FRAMES:-0}"
 DATA_ROOT="${DATA_ROOT:-data/VisDrone}"
@@ -130,9 +142,11 @@ python process_visdrone.py \
   --variant_mode "$VARIANT_MODE" \
   --n_variants "$N_VARIANTS" \
   --jitter_frac "$JITTER_FRAC" \
+  --midas_batch_size "$MIDAS_BATCH_SIZE" \
   --rclone_remote "$RCLONE_REMOTE" \
   --rclone_config "$RCLONE_CONFIG_PATH" \
   --drive_folder_id "$DRIVE_FOLDER_ID" \
+  --upload_workers "$UPLOAD_WORKERS" \
   --max_units_per_split "$MAX_UNITS" \
   --max_frames_per_unit "$MAX_FRAMES" \
   "${PRUNE_FLAG[@]}" \

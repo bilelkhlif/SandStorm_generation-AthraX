@@ -47,14 +47,18 @@ video pairs + metadata, not thousands of loose PNG/npy files.
 Auto-upload to Google Drive
 -----------------------------
 If --rclone_remote (default "gdrive") is configured and authorised on this
-machine, each split's EXPORT bundle is rclone-synced to the Drive folder
-identified by --drive_folder_id as soon as that split finishes. If rclone
+machine, each unit's EXPORT bundle is rclone-synced to the Drive folder
+identified by --drive_folder_id as soon as that unit's export is staged —
+not batched up per split, so results start appearing in Drive within
+seconds of the first unit finishing, not after the whole split. Uploads run
+on a small background thread pool (--upload_workers, default 3) so they
+overlap with GPU work on the next unit instead of blocking it. If rclone
 isn't installed/configured, this is skipped with a warning, not a crash —
 see README for the one-time setup (Google OAuth needs a real browser, so it
 can't be fully automated from a headless box the first time).
---prune_after_upload deletes each split's local EXPORT copy (not the raw
-ground-truth tree) right after a verified successful upload — always safe,
-since it's a small derived copy, not the only copy of anything.
+--prune_after_upload deletes each unit's local EXPORT copy (not the raw
+ground-truth tree) right after its upload is verified successful — always
+safe, since it's a small derived copy, not the only copy of anything.
 
 Resumable: a (unit, variant) pair whose raw output already has
 metadata.json is skipped; if every variant of a unit is already done, frame
@@ -72,6 +76,7 @@ Usage
 """
 
 import argparse
+import concurrent.futures
 import json
 import math
 import shutil
@@ -93,7 +98,7 @@ except ImportError as exc:
     )
 
 try:
-    from process_test_video import _load_midas, _estimate_depth_midas, _encode_output_video
+    from process_test_video import _load_midas, _estimate_depth_midas_batch, _encode_output_video
 except ImportError as exc:
     sys.exit(f"[ERROR] Cannot import process_test_video: {exc}")
 
@@ -225,10 +230,16 @@ def _variant_targets(unit_out: Path, seed: int, variant_mode: str, n_variants: i
 
 def _process_unit(unit_name: str, image_paths: list, split_out: Path, seed: int,
                    max_frames: int, use_gpu: bool, variant_mode: str, n_variants: int,
-                   jitter_frac: float) -> list:
+                   jitter_frac: float, midas_batch_size: int) -> list:
     """Produce the full raw ground-truth output for every variant of one
     unit. Returns a list of (label, status) — status is "processed",
     "skipped", or "failed: <reason>".
+
+    Two speed optimisations vs. calling degrade_video() N independent times:
+    depth is estimated once for the whole unit in GPU batches (not once per
+    frame), and clean_rgb/depth_maps -- identical across variants, since only
+    the degradation params differ -- are only written for variant 0; later
+    variants reuse that copy instead of re-writing the same files.
     """
     unit_out = split_out / unit_name
     variants = _variant_targets(unit_out, seed, variant_mode, n_variants, jitter_frac)
@@ -250,11 +261,11 @@ def _process_unit(unit_name: str, image_paths: list, split_out: Path, seed: int,
     if not frames_u8:
         raise RuntimeError("no readable frames in unit")
 
-    depth_frames = [_estimate_depth_midas(f) for f in frames_u8]
+    depth_frames = _estimate_depth_midas_batch(frames_u8, batch_size=midas_batch_size)
     clean_frames = [f.astype(np.float32) / 255.0 for f in frames_u8]
 
     results = []
-    for label, v_out, payload in variants:
+    for idx, (label, v_out, payload) in enumerate(variants):
         if (v_out / "metadata.json").exists():
             results.append((label, "skipped"))
             continue
@@ -269,6 +280,8 @@ def _process_unit(unit_name: str, image_paths: list, split_out: Path, seed: int,
                 n_ray_steps=64,
                 n_blur_levels=16,
                 use_gpu=use_gpu,
+                save_clean_rgb=(idx == 0),
+                save_depth_maps=(idx == 0),
             )
             results.append((label, "processed"))
         except Exception as exc:
@@ -303,26 +316,30 @@ def _export_unit(unit_name: str, variants: list, unit_export: Path,
     metadata.json. Single-frame units get clean.png/degraded.png instead of
     video. Skips anything already staged.
     """
-    src = next((out for _, out, _ in variants if (out / "metadata.json").exists()), None)
-    if src is None:
+    finished = [(label, out) for label, out, _ in variants if (out / "metadata.json").exists()]
+    if not finished:
         return  # nothing finished for this unit yet
 
     unit_export.mkdir(parents=True, exist_ok=True)
-    clean_dir = src / "clean_rgb"
-    clean_frames = sorted(clean_dir.glob("frame_*.png"))
 
-    if len(clean_frames) > 1:
-        clean_video = unit_export / "clean.mp4"
-        if encode_video and not clean_video.exists():
-            _encode_from_dir(clean_dir, clean_video, fps)
-    elif len(clean_frames) == 1:
-        clean_img = unit_export / "clean.png"
-        if not clean_img.exists():
-            shutil.copy2(clean_frames[0], clean_img)
+    # clean_rgb/depth_maps are only saved for variant 0 (see _process_unit) --
+    # source from whichever finished variant actually has clean_rgb content
+    # (normally variant 0; falls back gracefully if that one specifically
+    # failed while a later variant succeeded).
+    clean_src = next((out for _, out in finished if any((out / "clean_rgb").glob("frame_*.png"))), None)
+    if clean_src is not None:
+        clean_dir = clean_src / "clean_rgb"
+        clean_frames = sorted(clean_dir.glob("frame_*.png"))
+        if len(clean_frames) > 1:
+            clean_video = unit_export / "clean.mp4"
+            if encode_video and not clean_video.exists():
+                _encode_from_dir(clean_dir, clean_video, fps)
+        elif len(clean_frames) == 1:
+            clean_img = unit_export / "clean.png"
+            if not clean_img.exists():
+                shutil.copy2(clean_frames[0], clean_img)
 
-    for label, v_out, _ in variants:
-        if not (v_out / "metadata.json").exists():
-            continue
+    for label, v_out in finished:
         v_export = unit_export / label if label else unit_export
         v_export.mkdir(parents=True, exist_ok=True)
 
@@ -385,6 +402,18 @@ def _rclone_sync(local_dir: Path, remote: str, folder_id: str, dest_subpath: str
     except Exception as exc:
         print(f"  [upload WARN] rclone failed for {local_dir}: {exc!r}")
         return False
+
+
+def _sync_and_maybe_prune(local_dir: Path, remote: str, folder_id: str, dest_subpath: str,
+                           config_path: str, prune: bool) -> bool:
+    """Runs on the upload thread pool: sync one unit's export bundle, then
+    delete the local copy if it was requested AND the upload actually
+    succeeded (never prune on a failed/partial sync).
+    """
+    ok = _rclone_sync(local_dir, remote, folder_id, dest_subpath, config_path)
+    if ok and prune:
+        shutil.rmtree(local_dir, ignore_errors=True)
+    return ok
 
 
 # =========================================================================== #
@@ -465,14 +494,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n_variants", type=int, default=3,
                          help="Independent degraded variants generated per unit in jitter mode "
                               "(default: 3). Ignored in random mode (always 1).")
+    parser.add_argument("--midas_batch_size", type=int, default=8,
+                         help="Frames per MiDaS depth-estimation GPU call (default: 8). Higher uses "
+                              "more VRAM but fewer, larger GPU calls -- matters most on long "
+                              "VisDrone-VID sequences where depth was otherwise estimated one frame "
+                              "at a time.")
     parser.add_argument("--jitter_frac", type=float, default=0.35,
                          help="Jitter window width as a fraction of each parameter's full Table 4 "
                               "range, centred on the reference config (default: 0.35)")
     parser.add_argument("--rclone_remote", default="gdrive",
-                         help="rclone remote name to auto-sync the export bundle to after each split "
-                              "finishes; empty string disables upload. Requires a one-time "
-                              "'rclone config' on this machine authorising Google Drive access -- "
-                              "see README. (default: gdrive)")
+                         help="rclone remote name to auto-sync each unit's export bundle to as soon "
+                              "as it's staged (not batched per split); empty string disables upload. "
+                              "Requires a one-time 'rclone config' on this machine authorising Google "
+                              "Drive access -- see README. (default: gdrive)")
     parser.add_argument("--rclone_config", default=_RCLONE_CONFIG_DEFAULT,
                          help="Path to the rclone config file. Defaults next to this script rather "
                               "than rclone's usual ~/.config/rclone/rclone.conf, because some hosted "
@@ -482,9 +516,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--drive_folder_id", default="1WCbhitewaqUKYb9iemvC4_UMGJtglqY0",
                          help="Google Drive folder ID to upload into (the id from the folder's URL). "
                               "Default is the project's configured destination folder.")
+    parser.add_argument("--upload_workers", type=int, default=3,
+                         help="Concurrent background upload threads (default: 3). Uploads run "
+                              "alongside GPU processing of the next unit, not blocking it.")
     parser.add_argument("--prune_after_upload", action="store_true",
-                         help="Delete each split's local EXPORT copy (never the raw ground-truth "
-                              "tree) right after a verified successful Drive upload. Off by default.")
+                         help="Delete each unit's local EXPORT copy (never the raw ground-truth "
+                              "tree) right after its upload is verified successful. Off by default.")
     parser.add_argument("--max_units_per_split", type=int, default=0,
                          help="Cap units (sequences/images) processed per split; 0 = no limit")
     parser.add_argument("--max_frames_per_unit", type=int, default=0,
@@ -550,7 +587,8 @@ def main() -> None:
         upload_enabled = False
     elif upload_enabled:
         print(f"[visdrone] auto-upload: {args.rclone_remote}: -> Drive folder {args.drive_folder_id} "
-              f"(export bundle, after each split; prune_after_upload={args.prune_after_upload})\n"
+              f"(per unit, as soon as its export is staged; {args.upload_workers} background worker(s); "
+              f"prune_after_upload={args.prune_after_upload})\n"
               f"[visdrone] rclone config file: {args.rclone_config}"
               + ("  (exists)" if Path(args.rclone_config).exists() else "  (MISSING -- "
                  "run: rclone config --config \"" + args.rclone_config + "\")"))
@@ -562,6 +600,10 @@ def main() -> None:
     export_root = Path(args.export_dir)
     export_root.mkdir(parents=True, exist_ok=True)
     failures_path = output_root / "failures.log"
+
+    upload_pool = (concurrent.futures.ThreadPoolExecutor(max_workers=args.upload_workers)
+                   if upload_enabled else None)
+    upload_futures = []  # (tag, Future[bool]) -- reaped at the end for a failure count
 
     summary = {}
     global_i = 0
@@ -583,6 +625,7 @@ def main() -> None:
                     variant_mode=args.variant_mode,
                     n_variants=n_variants,
                     jitter_frac=args.jitter_frac,
+                    midas_batch_size=args.midas_batch_size,
                 )
             except Exception as exc:
                 s["total"] += n_variants
@@ -608,31 +651,27 @@ def main() -> None:
                         fh.write(msg + "\n")
 
             # Stage the lightweight export bundle from whatever raw output
-            # now exists on disk (just-produced or already there).
+            # now exists on disk (just-produced or already there), then hand
+            # its upload to the background pool -- submit and move straight
+            # on to the next unit's GPU work rather than waiting for it.
             try:
                 variants = _variant_targets(split_out / unit_name, seed, args.variant_mode,
                                              n_variants, args.jitter_frac)
-                _export_unit(unit_name, variants, split_export / unit_name,
+                unit_export = split_export / unit_name
+                _export_unit(unit_name, variants, unit_export,
                               encode_video=not args.no_video, fps=args.fps)
+                if upload_enabled:
+                    tag = f"{split_dir.name}/{unit_name}"
+                    fut = upload_pool.submit(
+                        _sync_and_maybe_prune, unit_export, args.rclone_remote,
+                        args.drive_folder_id, tag, args.rclone_config, args.prune_after_upload,
+                    )
+                    upload_futures.append((tag, fut))
             except Exception as exc:
                 msg = f"{split_dir.name}/{unit_name}: (export) {exc!r}"
                 print(f"  [FAIL] {msg}")
                 with open(failures_path, "a", encoding="utf-8") as fh:
                     fh.write(msg + "\n")
-
-        # Split finished -- sync the export bundle now rather than waiting
-        # for the whole run, so upload overlaps with the next split's GPU
-        # work. The raw ground-truth tree is never uploaded or pruned.
-        if upload_enabled:
-            print(f"[upload] syncing {split_export} -> {args.rclone_remote}:{split_dir.name} ...")
-            ok = _rclone_sync(split_export, args.rclone_remote, args.drive_folder_id, split_dir.name,
-                               args.rclone_config)
-            if ok and args.prune_after_upload:
-                print(f"[prune] removing local export copy {split_export} after verified upload")
-                shutil.rmtree(split_export, ignore_errors=True)
-            elif not ok:
-                print(f"  [upload WARN] {split_dir.name} export not fully synced -- kept locally "
-                      f"regardless of --prune_after_upload; re-run to retry.")
 
     elapsed = time.time() - t0
     summary["_elapsed_seconds"] = elapsed
@@ -641,8 +680,17 @@ def main() -> None:
     with open(output_root / "run_summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
 
+    n_upload_fail = 0
     if upload_enabled:
-        print("[upload] final sync (any retries) ...")
+        print(f"[upload] waiting for {len(upload_futures)} pending upload(s) to finish ...")
+        upload_pool.shutdown(wait=True)
+        for tag, fut in upload_futures:
+            if not fut.result():
+                n_upload_fail += 1
+        if n_upload_fail:
+            print(f"[upload] WARNING: {n_upload_fail} unit(s) failed to sync -- re-run this script "
+                  f"to retry them (already-uploaded units are skipped automatically).")
+        print("[upload] final catch-all sync (run_summary.json + any stragglers) ...")
         _rclone_sync(export_root, args.rclone_remote, args.drive_folder_id, "", args.rclone_config)
 
     print("\n" + "=" * 60)

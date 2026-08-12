@@ -153,6 +153,20 @@ def _load_midas() -> None:
         )
 
 
+def _postprocess_midas_pred(pred: np.ndarray, H: int, W: int) -> np.ndarray:
+    """Shared resize + disparity->pseudo-metric-depth rescale for one MiDaS
+    prediction. Factored out so the single-frame and batched paths below are
+    numerically identical, not just similar.
+    """
+    pred = cv2.resize(pred.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
+    d_min, d_max = pred.min(), pred.max()
+    if d_max - d_min < 1e-6:
+        # Degenerate / uniform frame → mid-range depth
+        return np.full((H, W), 0.5 * (DEPTH_MIN_M + DEPTH_MAX_M), dtype=np.float32)
+    depth_proxy = 1.0 - (pred - d_min) / (d_max - d_min)   # 0=near, 1=far
+    return (DEPTH_MIN_M + depth_proxy * (DEPTH_MAX_M - DEPTH_MIN_M)).astype(np.float32)
+
+
 def _estimate_depth_midas(rgb_uint8: np.ndarray) -> np.ndarray:
     """
     Run MiDaS DPT on one uint8 RGB frame and return pseudo-metric depth.
@@ -183,21 +197,52 @@ def _estimate_depth_midas(rgb_uint8: np.ndarray) -> np.ndarray:
     with torch.no_grad():
         pred = _midas_model(**inputs).predicted_depth.squeeze().cpu().numpy()
 
-    # Resize output to original frame resolution
     H, W = rgb_uint8.shape[:2]
-    pred = cv2.resize(pred.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
+    return _postprocess_midas_pred(pred, H, W)
 
-    d_min, d_max = pred.min(), pred.max()
-    if d_max - d_min < 1e-6:
-        # Degenerate / uniform frame → mid-range depth
-        return np.full((H, W), 0.5 * (DEPTH_MIN_M + DEPTH_MAX_M), dtype=np.float32)
 
-    # Invert disparity → depth proxy in [0, 1]
-    depth_proxy = 1.0 - (pred - d_min) / (d_max - d_min)   # 0=near, 1=far
+def _estimate_depth_midas_batch(frames_u8: list, batch_size: int = 8) -> list:
+    """
+    Same as _estimate_depth_midas(), but processes frames in GPU batches
+    instead of one image at a time: fewer, larger model calls instead of many
+    small ones, so the GPU actually has enough work per call to be worth
+    using a faster card. Matters most on long VisDrone-VID sequences, where
+    depth is otherwise estimated one frame at a time for every frame.
+    Output is very close to calling _estimate_depth_midas() on each frame
+    individually, but not bit-identical: batch_size=1 matches exactly
+    (verified), while batching multiple images together shifts results by
+    roughly 0.1m out of the 198m depth range (~0.05%) -- deterministic,
+    reproducible, and inherent to how the underlying model batches, not a
+    bug in the per-sample extraction below. Negligible next to the fact
+    this depth estimate is already a documented approximation, not
+    calibrated ground truth.
 
-    # Rescale to pseudo-metric metres
-    depth_m = (DEPTH_MIN_M + depth_proxy * (DEPTH_MAX_M - DEPTH_MIN_M)).astype(np.float32)
-    return depth_m
+    Parameters
+    ----------
+    frames_u8  : list of (H, W, 3) uint8 RGB frames (H, W may vary per frame)
+    batch_size : frames per GPU call
+
+    Returns
+    -------
+    list of (H, W) float32 pseudo-metric depth maps, same order as input
+    """
+    import torch
+    from PIL import Image as PilImage
+
+    results = [None] * len(frames_u8)
+    for start in range(0, len(frames_u8), batch_size):
+        chunk = frames_u8[start:start + batch_size]
+        pil_imgs = [PilImage.fromarray(f) for f in chunk]
+        inputs = _midas_processor(images=pil_imgs, return_tensors="pt")
+        inputs = {k: v.to(_midas_device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            preds = _midas_model(**inputs).predicted_depth.cpu().numpy()  # (B, h, w)
+
+        for i, frame in enumerate(chunk):
+            H, W = frame.shape[:2]
+            results[start + i] = _postprocess_midas_pred(np.squeeze(preds[i]), H, W)
+    return results
 
 
 # =========================================================================== #

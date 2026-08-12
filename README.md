@@ -185,6 +185,17 @@ aren't even reloaded/re-depth-estimated — and a failure on one variant is
 logged to `output_visdrone/failures.log` without stopping sibling variants
 or other units.
 
+**Speed.** The GPU physics itself is fast (~1-2s/variant); most wall-clock
+time is MiDaS depth estimation and disk I/O, neither GPU-bound, so two
+things target that directly instead of just recommending a bigger card:
+depth is estimated in GPU batches (`--midas_batch_size`, default 8 frames
+per call, not one at a time — matters most on long VID sequences), and
+`clean_rgb`/`depth_maps` — identical across a unit's variants, since only
+the degradation params differ — are written once per unit instead of once
+per variant. If it's still too slow, `N_VARIANTS=1` is the biggest
+remaining lever (cuts both GPU and I/O work proportionally); narrowing
+`VISDRONE_SPLITS`/`MAX_UNITS`/`MAX_FRAMES` is the most direct one of all.
+
 ### Two-tier output: full ground truth locally, video + metadata to Drive
 
 `degrade_video()`'s full per-frame output (clean/degraded PNGs plus
@@ -204,9 +215,12 @@ metadata for each video" — not thousands of loose per-frame files.
 
 ### Auto-upload to Google Drive
 
-The export bundle is rclone-synced to a Drive folder as soon as each split
-finishes (not just at the end — this overlaps upload with the next split's
-GPU work). The raw ground-truth tree is never uploaded.
+Each unit's export bundle is rclone-synced to a Drive folder the moment
+that unit's clean+degraded video + metadata are staged — not batched up
+per split, so results start appearing in Drive within seconds of the first
+unit finishing. Uploads run on a small background thread pool
+(`UPLOAD_WORKERS`, default 3) so they overlap with GPU work on the next
+unit instead of blocking it. The raw ground-truth tree is never uploaded.
 This needs a **one-time interactive setup**, because Google OAuth requires
 a real browser and can't be completed unattended on a headless Studio the
 first time — after that, every future run uploads automatically with no
@@ -236,8 +250,8 @@ Until this is done, `run_visdrone.sh` still runs fine — upload is skipped
 with a clear warning and output just stays local. Target folder defaults to
 [this project's Drive folder](https://drive.google.com/drive/folders/1WCbhitewaqUKYb9iemvC4_UMGJtglqY0)
 (override with `DRIVE_FOLDER_ID`); the authorising Google account needs
-edit access to it. Pass `PRUNE_LOCAL=1` to delete each split's local
-**export** copy right after a *verified* successful upload — always safe,
+edit access to it. Pass `PRUNE_LOCAL=1` to delete each unit's local
+**export** copy right after its *verified* successful upload — always safe,
 since it only ever deletes the small derived video bundle, never the raw
 ground-truth tree, so nothing irreplaceable is lost. Off by default.
 
@@ -264,6 +278,8 @@ time budget.
 | `VARIANT_MODE` | `--variant_mode` | `jitter` | `jitter` = every param randomised per variant; `random` = legacy single draw |
 | `N_VARIANTS` | `--n_variants` | `3` | Variants generated per unit in jitter mode |
 | `JITTER_FRAC` | `--jitter_frac` | `0.35` | Jitter width as a fraction of each param's full Table 4 range |
+| `MIDAS_BATCH_SIZE` | `--midas_batch_size` | `8` | Frames per MiDaS GPU call; higher uses more VRAM, fewer/bigger calls |
+| `UPLOAD_WORKERS` | (see below) | `3` | Concurrent background upload threads |
 | `MAX_UNITS` | `--max_units_per_split` | `0` (unlimited) | Cap sequences/images processed per split |
 | `MAX_FRAMES` | `--max_frames_per_unit` | `0` (unlimited) | Cap frames processed per sequence |
 | `DATA_ROOT` | `--data_root` | `data/VisDrone` | Download/extraction location |
