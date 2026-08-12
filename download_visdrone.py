@@ -14,11 +14,22 @@ Idempotent: re-running skips any split whose zip already exists (validated
 as a real zip, not just present) and whose extraction folder already has
 content. Safe to re-run after an interrupted or rate-limited download.
 
+Google Drive rate-limiting: these are popular official files, and Google
+sometimes blocks anonymous downloads globally ("too many users have viewed
+or downloaded this file recently") for anywhere from minutes to ~24h — this
+is not specific to your machine or this script. Rather than give up after a
+few seconds, each file is retried patiently (default: every 5 minutes, for
+up to 6 hours) so you can start this once and leave it running; it grabs
+the file as soon as Google unblocks it. Tune with --retry_interval_min /
+--max_wait_hours, or just re-run the script later (already-downloaded
+files are skipped).
+
 Usage
 -----
     python download_visdrone.py                              # all 7 splits
     python download_visdrone.py --splits VisDrone2019-VID-val
     python download_visdrone.py --data_root /custom/path
+    python download_visdrone.py --max_wait_hours 12           # more patient
 """
 
 import argparse
@@ -44,32 +55,46 @@ _SPLITS = {
 }
 
 
-def _download_one(name: str, file_id: str, zip_name: str, archive_dir: Path, retries: int = 3) -> Path:
+def _download_one(name: str, file_id: str, zip_name: str, archive_dir: Path,
+                   max_wait_hours: float = 6.0, retry_interval_min: float = 5.0) -> Path:
+    """Download one file, patiently retrying on Google Drive's "too many
+    users" rate limit instead of giving up after a few seconds. Keeps
+    trying every retry_interval_min minutes for up to max_wait_hours before
+    raising -- meant to be started once and left running.
+    """
     dest = archive_dir / zip_name
     if dest.exists() and zipfile.is_zipfile(dest):
         print(f"[skip] {name}: already downloaded ({dest})")
         return dest
 
     url = f"https://drive.google.com/uc?id={file_id}"
-    for attempt in range(1, retries + 1):
+    deadline = time.time() + max_wait_hours * 3600
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             gdown.download(url, str(dest), quiet=False)
             if dest.exists() and zipfile.is_zipfile(dest):
                 return dest
-            print(f"[warn] {name}: downloaded file is not a valid zip (attempt {attempt}/{retries})")
+            print(f"[warn] {name}: downloaded file is not a valid zip (attempt {attempt})")
         except Exception as exc:
-            print(f"[warn] {name}: download failed: {exc} (attempt {attempt}/{retries})")
+            print(f"[warn] {name}: {exc} (attempt {attempt})")
         if dest.exists():
             dest.unlink()
-        if attempt < retries:
-            time.sleep(5 * attempt)
 
-    raise RuntimeError(
-        f"failed after {retries} attempts. Google Drive sometimes rate-limits "
-        f"anonymous downloads of popular files ('too many users have viewed or "
-        f"downloaded this file'). Wait a few minutes and re-run this script — "
-        f"already-completed splits are skipped automatically."
-    )
+        remaining_sec = deadline - time.time()
+        if remaining_sec <= 0:
+            raise RuntimeError(
+                f"still rate-limited after {max_wait_hours:.1f}h and {attempt} attempts. "
+                f"Google says this can take up to 24h to clear. Re-run this script later "
+                f"(add --max_wait_hours to wait longer next time) — already-completed "
+                f"splits are skipped automatically."
+            )
+        wait_sec = min(retry_interval_min * 60, remaining_sec)
+        print(f"[wait] {name}: Google Drive is rate-limiting this file right now — "
+              f"retrying in {wait_sec / 60:.0f} min (will keep trying for up to "
+              f"{remaining_sec / 3600:.1f}h more) ...")
+        time.sleep(wait_sec)
 
 
 def _extract_one(name: str, zip_path: Path, data_root: Path) -> None:
@@ -91,6 +116,11 @@ def main() -> None:
                      help="Where to extract the dataset (default: data/VisDrone)")
     ap.add_argument("--splits", nargs="+", choices=list(_SPLITS) + ["all"], default=["all"],
                      help="Which split(s) to download (default: all)")
+    ap.add_argument("--max_wait_hours", type=float, default=6.0,
+                     help="Keep retrying a rate-limited file for up to this many hours before "
+                          "giving up on it and moving to the next split (default: 6)")
+    ap.add_argument("--retry_interval_min", type=float, default=5.0,
+                     help="Minutes to wait between retries while rate-limited (default: 5)")
     args = ap.parse_args()
 
     splits = list(_SPLITS) if "all" in args.splits else args.splits
@@ -103,7 +133,9 @@ def main() -> None:
     for name in splits:
         file_id, zip_name = _SPLITS[name]
         try:
-            zip_path = _download_one(name, file_id, zip_name, archive_dir)
+            zip_path = _download_one(name, file_id, zip_name, archive_dir,
+                                      max_wait_hours=args.max_wait_hours,
+                                      retry_interval_min=args.retry_interval_min)
             _extract_one(name, zip_path, args.data_root)
         except Exception as exc:
             print(f"[ERROR] {name}: {exc}")
