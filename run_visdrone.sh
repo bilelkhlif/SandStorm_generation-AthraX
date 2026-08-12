@@ -24,8 +24,15 @@
 #   OUTPUT_DIR         raw per-frame ground truth, local only      (default: output_visdrone)
 #   EXPORT_DIR         video+metadata bundle, this is what's uploaded (default: output_visdrone_drive)
 #   RCLONE_REMOTE      rclone remote name; empty disables upload   (default: gdrive)
+#   RCLONE_CONFIG_PATH path to the rclone config file (see below)   (default: ./rclone.conf, next to this script)
 #   DRIVE_FOLDER_ID    target Google Drive folder ID                (default: project's folder)
 #   PRUNE_LOCAL        1 = delete each split's EXPORT copy locally after a verified upload (default: 0)
+#
+# rclone's config defaults to ~/.config/rclone/rclone.conf, which some hosted
+# environments (seen on Lightning AI Studios) refuse to write to. Everything
+# here instead points --config at ./rclone.conf, next to this script, in a
+# directory this project already writes to successfully. It contains an
+# OAuth token -- gitignored, never commit it.
 #
 # Every input is degraded N_VARIANTS times by default, each variant randomly
 # jittering EVERY parameter around a known-good reference config (not just
@@ -70,6 +77,7 @@ DATA_ROOT="${DATA_ROOT:-data/VisDrone}"
 OUTPUT_DIR="${OUTPUT_DIR:-output_visdrone}"
 EXPORT_DIR="${EXPORT_DIR:-output_visdrone_drive}"
 RCLONE_REMOTE="${RCLONE_REMOTE:-gdrive}"
+RCLONE_CONFIG_PATH="${RCLONE_CONFIG_PATH:-$(pwd)/rclone.conf}"
 DRIVE_FOLDER_ID="${DRIVE_FOLDER_ID:-1WCbhitewaqUKYb9iemvC4_UMGJtglqY0}"
 PRUNE_LOCAL="${PRUNE_LOCAL:-0}"
 
@@ -100,12 +108,15 @@ if [ -n "$RCLONE_REMOTE" ] && ! command -v rclone >/dev/null 2>&1; then
     || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
 fi
 
-if [ -n "$RCLONE_REMOTE" ] && command -v rclone >/dev/null 2>&1 && ! rclone listremotes 2>/dev/null | grep -q "^${RCLONE_REMOTE}:$"; then
+if [ -n "$RCLONE_REMOTE" ] && command -v rclone >/dev/null 2>&1 \
+   && ! rclone --config "$RCLONE_CONFIG_PATH" listremotes 2>/dev/null | grep -q "^${RCLONE_REMOTE}:$"; then
   echo "--- rclone remote '$RCLONE_REMOTE' is not configured yet ---"
   echo "    Drive auto-upload will be skipped this run. One-time setup (see README):"
-  echo "    run 'rclone config' here, create a remote named '$RCLONE_REMOTE' (type: drive),"
-  echo "    answer 'n' to auto config, and use 'rclone authorize \"drive\"' on a machine with"
-  echo "    a browser to get the token this prompts you for."
+  echo "    run:  rclone config --config \"$RCLONE_CONFIG_PATH\""
+  echo "    create a remote named '$RCLONE_REMOTE' (type: drive), answer 'n' to auto config,"
+  echo "    and use 'rclone authorize \"drive\"' on a machine with a browser to get the token"
+  echo "    this prompts you for. Must use --config \"$RCLONE_CONFIG_PATH\" -- rclone's default"
+  echo "    location isn't writable in some hosted environments (Lightning AI Studios included)."
 fi
 
 echo "=== [2/4] Downloading + extracting VisDrone ==="
@@ -120,6 +131,7 @@ python process_visdrone.py \
   --n_variants "$N_VARIANTS" \
   --jitter_frac "$JITTER_FRAC" \
   --rclone_remote "$RCLONE_REMOTE" \
+  --rclone_config "$RCLONE_CONFIG_PATH" \
   --drive_folder_id "$DRIVE_FOLDER_ID" \
   --max_units_per_split "$MAX_UNITS" \
   --max_frames_per_unit "$MAX_FRAMES" \

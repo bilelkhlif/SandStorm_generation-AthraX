@@ -346,11 +346,22 @@ def _export_unit(unit_name: str, variants: list, unit_export: Path,
 #  GOOGLE DRIVE AUTO-UPLOAD  (rclone)
 # =========================================================================== #
 
+# Some hosted environments (seen on Lightning AI Studios) don't allow writes
+# to the default ~/.config/rclone/rclone.conf path. Every rclone call here
+# explicitly points --config at a fixed path next to this script instead --
+# a location this project already writes to successfully (git, output_*/,
+# data/), and the SAME path an interactively-run `rclone config` must be
+# told to use (see README) so the token it saves is the one this script
+# actually reads. Contains an OAuth token -- gitignored, never commit it.
+_RCLONE_CONFIG_DEFAULT = str(Path(__file__).resolve().parent / "rclone.conf")
+
+
 def _rclone_available() -> bool:
     return shutil.which("rclone") is not None
 
 
-def _rclone_sync(local_dir: Path, remote: str, folder_id: str, dest_subpath: str) -> bool:
+def _rclone_sync(local_dir: Path, remote: str, folder_id: str, dest_subpath: str,
+                  config_path: str) -> bool:
     """Copy local_dir's contents into <remote>:<dest_subpath>, rooted at the
     Drive folder identified by folder_id. Never raises -- upload failures are
     logged and treated as non-fatal so a flaky network doesn't cost local
@@ -359,7 +370,8 @@ def _rclone_sync(local_dir: Path, remote: str, folder_id: str, dest_subpath: str
     if not local_dir.exists():
         return True
     cmd = [
-        "rclone", "copy", str(local_dir), f"{remote}:{dest_subpath}",
+        "rclone", "--config", config_path,
+        "copy", str(local_dir), f"{remote}:{dest_subpath}",
         "--drive-root-folder-id", folder_id,
         "--transfers", "8", "--checkers", "8", "-q",
     ]
@@ -461,6 +473,12 @@ def _parse_args() -> argparse.Namespace:
                               "finishes; empty string disables upload. Requires a one-time "
                               "'rclone config' on this machine authorising Google Drive access -- "
                               "see README. (default: gdrive)")
+    parser.add_argument("--rclone_config", default=_RCLONE_CONFIG_DEFAULT,
+                         help="Path to the rclone config file. Defaults next to this script rather "
+                              "than rclone's usual ~/.config/rclone/rclone.conf, because some hosted "
+                              "environments (seen on Lightning AI) refuse writes there. Run "
+                              "'rclone config' with this SAME path (--config <this value>) to set up "
+                              "the remote it will actually use -- see README.")
     parser.add_argument("--drive_folder_id", default="1WCbhitewaqUKYb9iemvC4_UMGJtglqY0",
                          help="Google Drive folder ID to upload into (the id from the folder's URL). "
                               "Default is the project's configured destination folder.")
@@ -532,7 +550,10 @@ def main() -> None:
         upload_enabled = False
     elif upload_enabled:
         print(f"[visdrone] auto-upload: {args.rclone_remote}: -> Drive folder {args.drive_folder_id} "
-              f"(export bundle, after each split; prune_after_upload={args.prune_after_upload})")
+              f"(export bundle, after each split; prune_after_upload={args.prune_after_upload})\n"
+              f"[visdrone] rclone config file: {args.rclone_config}"
+              + ("  (exists)" if Path(args.rclone_config).exists() else "  (MISSING -- "
+                 "run: rclone config --config \"" + args.rclone_config + "\")"))
 
     _load_midas()
 
@@ -604,7 +625,8 @@ def main() -> None:
         # work. The raw ground-truth tree is never uploaded or pruned.
         if upload_enabled:
             print(f"[upload] syncing {split_export} -> {args.rclone_remote}:{split_dir.name} ...")
-            ok = _rclone_sync(split_export, args.rclone_remote, args.drive_folder_id, split_dir.name)
+            ok = _rclone_sync(split_export, args.rclone_remote, args.drive_folder_id, split_dir.name,
+                               args.rclone_config)
             if ok and args.prune_after_upload:
                 print(f"[prune] removing local export copy {split_export} after verified upload")
                 shutil.rmtree(split_export, ignore_errors=True)
@@ -621,7 +643,7 @@ def main() -> None:
 
     if upload_enabled:
         print("[upload] final sync (any retries) ...")
-        _rclone_sync(export_root, args.rclone_remote, args.drive_folder_id, "")
+        _rclone_sync(export_root, args.rclone_remote, args.drive_folder_id, "", args.rclone_config)
 
     print("\n" + "=" * 60)
     print("[visdrone] RUN SUMMARY")

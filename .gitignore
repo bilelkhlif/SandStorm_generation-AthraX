@@ -48,6 +48,7 @@ Thumbs.db
 # Secrets / environment
 .env
 *.env
+rclone.conf
 
 # PDFs kept only locally
 *.pdf
