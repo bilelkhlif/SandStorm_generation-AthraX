@@ -63,8 +63,13 @@ safe, since it's a small derived copy, not the only copy of anything.
 Resumable: a (unit, variant) pair whose raw output already has
 metadata.json is skipped; if every variant of a unit is already done, frame
 loading + depth estimation for that unit is skipped entirely. The export
-step independently skips whatever's already staged. Fault-isolated:
-failures are logged to <output_dir>/failures.log and don't stop the rest.
+step independently skips whatever's already staged. When upload is enabled,
+each split's Drive folder is also listed once up front (one rclone call) so
+a brand-new machine with zero local state recognises units a *previous*
+machine already finished and uploaded, and skips them too -- no re-download,
+re-degrade, or re-upload, just continues with whatever's left in the split.
+Fault-isolated: failures are logged to <output_dir>/failures.log and don't
+stop the rest.
 
 Usage
 -----
@@ -416,6 +421,45 @@ def _sync_and_maybe_prune(local_dir: Path, remote: str, folder_id: str, dest_sub
     return ok
 
 
+def _list_drive_completed_units(remote: str, folder_id: str, split_name: str, config_path: str,
+                                 n_variants: int, variant_mode: str) -> set:
+    """One recursive Drive listing for a split, parsed into the set of unit
+    names that already have a COMPLETE export bundle there (n_variants worth
+    of metadata.json). Lets a brand-new machine with no local state at all
+    recognise what a previous machine already finished and uploaded, and skip
+    straight past it instead of re-downloading/re-degrading/re-uploading it.
+
+    Counts metadata.json files per unit rather than matching exact variant
+    folder names, because jitter-mode folder names embed the sampled beta
+    value (e.g. variant_00_beta0.0071) which won't reproduce identically
+    across machines/seeds -- a count match is what actually indicates
+    completeness. Returns an empty set (i.e. "nothing done yet, process
+    everything") on any failure: no rclone, no config, remote split folder
+    doesn't exist yet, network error, etc. -- never blocks a run.
+    """
+    cmd = [
+        "rclone", "--config", config_path, "lsf", "-R", "--files-only",
+        f"{remote}:{split_name}", "--drive-root-folder-id", folder_id,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except Exception:
+        return set()
+    if result.returncode != 0:
+        return set()
+
+    meta_counts = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.endswith("metadata.json"):
+            continue
+        unit = line.split("/", 1)[0]
+        meta_counts[unit] = meta_counts.get(unit, 0) + 1
+
+    needed = 1 if variant_mode == "random" else n_variants
+    return {unit for unit, count in meta_counts.items() if count >= needed}
+
+
 # =========================================================================== #
 #  SIZE ESTIMATE  (ground-truth .npy maps are the dominant local-disk cost)
 # =========================================================================== #
@@ -613,9 +657,23 @@ def main() -> None:
         split_export = export_root / split_dir.name
         s = summary.setdefault(split_dir.name, {"processed": 0, "skipped": 0, "failed": 0, "total": 0})
 
+        drive_done = set()
+        if upload_enabled:
+            drive_done = _list_drive_completed_units(
+                args.rclone_remote, args.drive_folder_id, split_dir.name,
+                args.rclone_config, n_variants, args.variant_mode,
+            )
+            if drive_done:
+                print(f"[visdrone] {split_dir.name}: Drive already has {len(drive_done)}/{len(units)} "
+                      f"unit(s) complete -- skipping those, continuing with the rest")
+
         for unit_name, image_paths in tqdm(units, desc=split_dir.name, unit="unit"):
             seed = args.seed + global_i
             global_i += 1
+            if unit_name in drive_done:
+                s["total"] += n_variants
+                s["skipped"] += n_variants
+                continue
             try:
                 results = _process_unit(
                     unit_name, image_paths, split_out,

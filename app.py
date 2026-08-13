@@ -677,12 +677,12 @@ def _render_output(output_dir: Path, metadata: Dict[str, Any]) -> None:
         with col_a:
             st.caption(f"Clean input  —  frame {frame_idx:04d}")
             if clean_img is not None:
-                st.image(clean_img, use_container_width=True)
+                st.image(clean_img, use_column_width=True)
 
         with col_b:
             st.caption(f"Degraded output  —  frame {frame_idx:04d}")
             if deg_img is not None:
-                st.image(deg_img, use_container_width=True)
+                st.image(deg_img, use_column_width=True)
 
     # ── Physical statistics ─────────────────────────────────────────────────
     st.markdown("### Physical Statistics  (frame 0)")
@@ -762,7 +762,6 @@ def _render_output(output_dir: Path, metadata: Dict[str, Any]) -> None:
                 data=video_path.read_bytes(),
                 file_name="sandstorm_video.mp4",
                 mime="video/mp4",
-                use_container_width=True,
             )
 
     meta_path = output_dir / "metadata.json"
@@ -773,7 +772,6 @@ def _render_output(output_dir: Path, metadata: Dict[str, Any]) -> None:
                 data=meta_path.read_text(encoding="utf-8"),
                 file_name="metadata.json",
                 mime="application/json",
-                use_container_width=True,
             )
 
     npy_files = _npy_paths(output_dir)
@@ -784,7 +782,6 @@ def _render_output(output_dir: Path, metadata: Dict[str, Any]) -> None:
                 data=_zip_npy_maps(output_dir),
                 file_name="physical_maps.zip",
                 mime="application/zip",
-                use_container_width=True,
             )
 
     # ── Processing log ──────────────────────────────────────────────────────
@@ -850,7 +847,6 @@ def main() -> None:
         run = st.button(
             "Run pipeline",
             type="primary",
-            use_container_width=True,
         )
 
     # ── Pipeline execution ───────────────────────────────────────────────────
